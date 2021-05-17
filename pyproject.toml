@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "anyio-mqtt"
+version = "0.1.0"
+description = ""
+authors = ["Ellis Percival <anyio-mqtt@failcode.co.uk>"]
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.7"
+anyio = "^3.0.1"
+paho-mqtt = "^1.5.1"
+transitions = "^0.8.8"
+
+[tool.poetry.dev-dependencies]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
