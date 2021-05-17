@@ -1,4 +1,5 @@
 import logging
+import math
 import socket
 from functools import partial, wraps
 from typing import Any, Dict, List, Optional, Tuple
@@ -51,35 +52,54 @@ class AnyIOMQTTClient:
         self._subscriptions = []
         self._connect_args: Optional[Tuple[List, Dict[str, Any]]] = None
 
-        self._task_group.start_soon(self._read_loop)
-        self._task_group.start_soon(self._write_loop)
-        self._task_group.start_soon(self._misc_loop)
-
         self._connecting_cancel_scope: Optional[anyio.CancelScope] = None
+        self._loop_cancel_scope: Optional[anyio.CancelScope] = None
 
     # State machine callbacks
     def on_enter_connecting(self):
         async def do_connect():
             async with anyio.create_task_group() as tg:
                 self._connecting_cancel_scope = tg.cancel_scope
-                await self._connect_loop()
-                self._connecting_cancel_scope = None
+                tg.start_soon(self._connect_loop)
+            self._connecting_cancel_scope = None
 
         self._task_group.start_soon(do_connect)
 
     def on_exit_connecting(self):
         if self._connecting_cancel_scope is not None:
             self._connecting_cancel_scope.cancel()
+            self._connecting_cancel_scope = None
+
+    def on_enter_disconnected(self):
+        if self._loop_cancel_scope is not None:
+            self._loop_cancel_scope.cancel()
+            self._loop_cancel_scope = None
+
+    def on_exit_disconnected(self):
+        async def start_loops():
+            async with anyio.create_task_group() as tg:
+                self._loop_cancel_scope = tg.cancel_scope
+                tg.start_soon(self._open_msg_stream)
+                tg.start_soon(self._read_loop)
+                tg.start_soon(self._write_loop)
+                tg.start_soon(self._misc_loop)
+            self._loop_cancel_scope = None
+
+        self._msg_tx, self._msg_rx = anyio.create_memory_object_stream()
+        self._task_group.start_soon(start_loops)
 
     # Public API
     def connect(self, *args, **kwargs):
+        _LOG.debug("connect() called")
         self._connect_args = (args, kwargs)
         self._state_request_connect()
 
     def disconnect(self, *args, **kwargs):
+        _LOG.debug("disconnect() called")
         self._client.disconnect(*args, **kwargs)
 
     def subscribe(self, *args, **kwargs) -> None:
+        _LOG.debug("subscribe() called")
         self._subscriptions.append((args, kwargs))
         if self.is_connected():
             self._client.subscribe(*args, **kwargs)
@@ -97,14 +117,20 @@ class AnyIOMQTTClient:
             client.subscribe(*args, **kwargs)
 
     def _on_disconnect(self, client, userdata, rc, properties=None) -> None:
-        if rc == paho.MQTT_ERR_SUCCESS:
+        _LOG.debug("_on_disconnect() rc: %s", rc)
+        if rc == paho.MQTT_ERR_SUCCESS:  # rc == 0
             # Deliberately disconnected on client request
             self._state_disconnect()
         else:
             self._state_request_connect()
 
     def _on_message(self, client, userdata, msg: paho.MQTTMessage):
-        print(f"{msg.topic}: {msg.payload.decode('utf8')}")
+        _LOG.debug("MQTT message received on topic %s", msg.topic)
+        msg_tx = self._msg_tx.clone()
+        try:
+            msg_tx.send_nowait(msg)
+        except anyio.WouldBlock:
+            _LOG.warning("Discarding message because no handler is listening")
 
     def _on_socket_open(
         self, client: paho.Client, userdata: Any, sock: socket.socket
@@ -126,6 +152,7 @@ class AnyIOMQTTClient:
 
     # Loops
     async def _read_loop(self) -> None:
+        _LOG.debug("_read_loop() started")
         while True:
             await self._socket_open.wait()
             try:
@@ -137,6 +164,7 @@ class AnyIOMQTTClient:
             self._client.loop_read()
 
     async def _write_loop(self):
+        _LOG.debug("_write_loop() started")
         while True:
             await self._large_write.wait()
             await self._socket_open.wait()
@@ -148,6 +176,7 @@ class AnyIOMQTTClient:
             self._client.loop_write()
 
     async def _misc_loop(self) -> None:
+        _LOG.debug("_misc_loop() started")
         while True:
             # We don't really care what the return value is.
             # We'll just keep calling until we're cancelled.
@@ -155,6 +184,7 @@ class AnyIOMQTTClient:
             await anyio.sleep(1)
 
     async def _connect_loop(self) -> None:
+        _LOG.debug("_connect_loop() started")
         args, kwargs = self._connect_args
         while True:
             try:
@@ -167,3 +197,13 @@ class AnyIOMQTTClient:
                 continue
             _LOG.debug("_connect_loop() setting perform_connect state")
             return
+
+    async def _open_msg_stream(self):
+        """
+        Hold the tx end of the msg stream open so that we can clone it and send messages
+        from the paho on_message callback.
+        """
+        _LOG.debug("_open_msg_stream() started")
+        async with self._msg_tx:
+            while True:
+                await anyio.sleep(math.inf)
