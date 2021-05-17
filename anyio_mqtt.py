@@ -1,18 +1,19 @@
 import logging
 import socket
 from functools import partial, wraps
-from typing import Optional, Any, Tuple, List, Dict
-from transitions import Machine
+from typing import Any, Dict, List, Optional, Tuple
 
 import anyio
 import anyio.abc
 import paho.mqtt.client as paho
+from transitions import Machine
 
 _LOG = logging.getLogger(__name__)
 _LOG.setLevel(logging.DEBUG)
 
 logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("transitions").setLevel(logging.DEBUG)
+
 
 def event_looper(event_name: str):
     def _event_looper(func):
@@ -26,8 +27,11 @@ def event_looper(event_name: str):
                 except Exception:
                     _LOG.exception("Exception in %s", func)
                     await anyio.sleep(1)
+
         return wrapper
+
     return _event_looper
+
 
 class AnyIOMQTTClient:
     def __init__(self, task_group: anyio.abc.TaskGroup, config=None):
@@ -78,6 +82,7 @@ class AnyIOMQTTClient:
                 self._connecting_cancel_scope = tg.cancel_scope
                 await self._connect_loop()
                 self._connecting_cancel_scope = None
+
         self._task_group.start_soon(do_connect)
 
     def on_exit_connecting(self):
