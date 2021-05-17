@@ -15,24 +15,6 @@ logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("transitions").setLevel(logging.DEBUG)
 
 
-def event_looper(event_name: str):
-    def _event_looper(func):
-        @wraps(func)
-        async def wrapper(self, *args, **kwargs):
-            event: anyio.Event = getattr(self, event_name)
-            while True:
-                await event.wait()
-                try:
-                    await func(self, *args, **kwargs)
-                except Exception:
-                    _LOG.exception("Exception in %s", func)
-                    await anyio.sleep(1)
-
-        return wrapper
-
-    return _event_looper
-
-
 class AnyIOMQTTClient:
     def __init__(self, task_group: anyio.abc.TaskGroup, config=None):
         if config is None:
