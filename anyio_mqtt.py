@@ -13,8 +13,8 @@ from transitions import Machine
 _LOG = logging.getLogger(__name__)
 _LOG.setLevel(logging.DEBUG)
 
-logging.basicConfig(level=logging.DEBUG)
-logging.getLogger("transitions").setLevel(logging.DEBUG)
+# logging.basicConfig(level=logging.DEBUG)
+# logging.getLogger("transitions").setLevel(logging.DEBUG)
 
 
 # TODO:
@@ -252,7 +252,7 @@ class AnyIOMQTTClient:
             if connection_status != paho.MQTT_ERR_SUCCESS:
                 # TODO: Configurable reconnect delay / limit
                 await anyio.sleep(1)
-            _LOG.debug("_reconnect_loop() finiished")
+            _LOG.debug("_reconnect_loop() finished")
 
     async def _open_inbound_msgs_tx_stream(self):
         """
