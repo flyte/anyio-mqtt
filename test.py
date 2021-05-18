@@ -5,6 +5,9 @@ from anyio_mqtt import AnyIOMQTTClient
 import logging
 
 _LOG = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
+logging.getLogger("transitions").setLevel(logging.DEBUG)
+logging.getLogger("anyio_mqtt").setLevel(logging.DEBUG)
 
 
 async def main():

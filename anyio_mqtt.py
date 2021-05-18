@@ -11,10 +11,6 @@ import paho.mqtt.client as paho
 from transitions import Machine
 
 _LOG = logging.getLogger(__name__)
-_LOG.setLevel(logging.DEBUG)
-
-# logging.basicConfig(level=logging.DEBUG)
-# logging.getLogger("transitions").setLevel(logging.DEBUG)
 
 
 # TODO:
@@ -156,6 +152,7 @@ class AnyIOMQTTClient:
 
     def _on_disconnect(self, client, userdata, rc, properties=None) -> None:
         _LOG.debug("_on_disconnect() rc: %s", rc)
+        self._last_disconnect = datetime.now()
         if rc == paho.MQTT_ERR_SUCCESS:  # rc == 0
             # Deliberately disconnected on client request
             self._state_disconnect()
@@ -236,6 +233,12 @@ class AnyIOMQTTClient:
         _LOG.debug("_reconnect_loop() started")
         connection_status = None
         while connection_status != paho.MQTT_ERR_SUCCESS:
+            delay = (
+                (self._last_disconnect + timedelta(seconds=1)) - datetime.now()
+            ).total_seconds()
+            if delay > 0:
+                _LOG.info("Waiting %s second(s) before reconnecting", delay)
+                await anyio.sleep(delay)
             try:
                 _LOG.debug("(Re)connecting...")
                 connection_status = await anyio.to_thread.run_sync(
