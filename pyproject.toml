@@ -6,7 +6,7 @@ authors = ["Ellis Percival <anyio-mqtt@failcode.co.uk>"]
 license = "MIT"
 
 [tool.poetry.dependencies]
-python = "^3.7"
+python = "^3.6.2"
 anyio = "^3.0.1"
 paho-mqtt = "^1.5.1"
 transitions = "^0.8.8"
