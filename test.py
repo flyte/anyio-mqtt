@@ -6,6 +6,7 @@ import logging
 
 _LOG = logging.getLogger(__name__)
 
+
 async def main():
     async with anyio.create_task_group() as tg:
         _LOG.debug("Creating client")

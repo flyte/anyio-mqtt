@@ -60,10 +60,6 @@ class AnyIOMQTTClient:
             self._inbound_msgs_tx,
             self._inbound_msgs_rx,
         ) = anyio.create_memory_object_stream()
-        (
-            self._outbound_msgs_tx,
-            self._outbound_msgs_rx,
-        ) = anyio.create_memory_object_stream(max_buffer_size=10)
 
         self._socket_open = anyio.Event()
         self._large_write = anyio.Event()
@@ -92,8 +88,6 @@ class AnyIOMQTTClient:
             async with anyio.create_task_group() as tg:
                 self._other_loops_cancel_scope = tg.cancel_scope
                 tg.start_soon(self._open_inbound_msgs_tx_stream)
-                tg.start_soon(self._open_outbound_msgs_tx_stream)
-                tg.start_soon(self._publish_loop)
                 tg.start_soon(self._misc_loop)
             self._other_loops_cancel_scope = None
 
@@ -145,16 +139,7 @@ class AnyIOMQTTClient:
         self._client.subscribe(*args, **kwargs)
 
     def publish(self, *args, **kwargs):
-        # return self._client.publish(*args, **kwargs)
-        if self.is_disconnected():
-            raise DisconnectedException(
-                "Cannot publish while the client is disconnected."
-            )
-        tx_stream = self._outbound_msgs_tx.clone()
-        try:
-            tx_stream.send_nowait((args, kwargs))
-        except anyio.WouldBlock:
-            raise BufferError("Outbound message buffer is full")
+        return self._client.publish(*args, **kwargs)
 
     @property
     def messages(self):
@@ -281,20 +266,3 @@ class AnyIOMQTTClient:
         async with self._inbound_msgs_tx:
             while True:
                 await anyio.sleep(math.inf)
-
-    async def _open_outbound_msgs_tx_stream(self):
-        """
-        Hold the tx end of the outbound msgs stream open so that we can clone it and send
-        messages from the publish() method.
-        """
-        _LOG.debug("_open_outbound_msgs_tx_stream() started")
-        async with self._outbound_msgs_tx:
-            while True:
-                await anyio.sleep(math.inf)
-
-    async def _publish_loop(self):
-        _LOG.debug("_publish_loop() started")
-        async for args, kwargs in self._outbound_msgs_rx:
-            _LOG.debug("Publishing message %s %s", args, kwargs)
-            ret = self._client.publish(*args, **kwargs)
-            _LOG.debug("Paho client returned %s", ret)
