@@ -16,6 +16,13 @@ logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("transitions").setLevel(logging.DEBUG)
 
 
+# TODO:
+# - Error handling. Work out what constitutes a reason to break out of the connect loop
+#   and change back to disconnected state.
+# - QoS levels. How do they affect subscribing and publishing?
+# - Publishing.
+
+
 class AnyIOMQTTClient:
     def __init__(self, task_group: anyio.abc.TaskGroup, config=None):
         if config is None:
@@ -57,12 +64,23 @@ class AnyIOMQTTClient:
 
     # State machine callbacks
     def on_enter_connecting(self):
+        async def start_loops():
+            async with anyio.create_task_group() as tg:
+                self._loop_cancel_scope = tg.cancel_scope
+                tg.start_soon(self._open_msg_stream)
+                tg.start_soon(self._read_loop)
+                tg.start_soon(self._write_loop)
+                tg.start_soon(self._misc_loop)
+            self._loop_cancel_scope = None
+
         async def do_connect():
             async with anyio.create_task_group() as tg:
                 self._connecting_cancel_scope = tg.cancel_scope
                 tg.start_soon(self._connect_loop)
             self._connecting_cancel_scope = None
 
+        self._msg_tx, self._msg_rx = anyio.create_memory_object_stream()
+        self._task_group.start_soon(start_loops)
         self._task_group.start_soon(do_connect)
 
     def on_exit_connecting(self):
@@ -74,19 +92,6 @@ class AnyIOMQTTClient:
         if self._loop_cancel_scope is not None:
             self._loop_cancel_scope.cancel()
             self._loop_cancel_scope = None
-
-    def on_exit_disconnected(self):
-        async def start_loops():
-            async with anyio.create_task_group() as tg:
-                self._loop_cancel_scope = tg.cancel_scope
-                tg.start_soon(self._open_msg_stream)
-                tg.start_soon(self._read_loop)
-                tg.start_soon(self._write_loop)
-                tg.start_soon(self._misc_loop)
-            self._loop_cancel_scope = None
-
-        self._msg_tx, self._msg_rx = anyio.create_memory_object_stream()
-        self._task_group.start_soon(start_loops)
 
     # Public API
     def connect(self, *args, **kwargs):
@@ -103,6 +108,9 @@ class AnyIOMQTTClient:
         self._subscriptions.append((args, kwargs))
         if self.is_connected():
             self._client.subscribe(*args, **kwargs)
+
+    def publish(self, *args, **kwargs):
+        pass
 
     @property
     def messages(self):
