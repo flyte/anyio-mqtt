@@ -176,7 +176,11 @@ class AnyIOMQTTClient:
         _LOG.debug("_on_socket_open()")
         self._sock = sock
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2048)
-        self._socket_open.set()
+
+        async def set_socket_open():
+            self._socket_open.set()
+
+        anyio.from_thread.run(set_socket_open)
 
     def _on_socket_close(self, client, userdata, sock) -> None:
         self._sock = None
