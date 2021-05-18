@@ -3,6 +3,7 @@ import math
 import socket
 from functools import partial, wraps
 from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
 
 import anyio
 import anyio.abc
@@ -21,6 +22,10 @@ logging.getLogger("transitions").setLevel(logging.DEBUG)
 #   and change back to disconnected state.
 # - QoS levels. How do they affect subscribing and publishing?
 # - Publishing.
+
+
+class DisconnectedException(Exception):
+    pass
 
 
 class AnyIOMQTTClient:
@@ -51,74 +56,121 @@ class AnyIOMQTTClient:
         self._client.on_socket_register_write = self._on_socket_register_write
         self._client.on_socket_unregister_write = self._on_socket_unregister_write
 
-        self._msg_tx, self._msg_rx = anyio.create_memory_object_stream()
+        (
+            self._inbound_msgs_tx,
+            self._inbound_msgs_rx,
+        ) = anyio.create_memory_object_stream()
+        (
+            self._outbound_msgs_tx,
+            self._outbound_msgs_rx,
+        ) = anyio.create_memory_object_stream(max_buffer_size=10)
 
         self._socket_open = anyio.Event()
         self._large_write = anyio.Event()
 
         self._subscriptions = []
-        self._connect_args: Optional[Tuple[List, Dict[str, Any]]] = None
+        self._last_disconnect = datetime.min
 
-        self._connecting_cancel_scope: Optional[anyio.CancelScope] = None
-        self._loop_cancel_scope: Optional[anyio.CancelScope] = None
+        self._reconnect_loop_cancel_scope: Optional[anyio.CancelScope] = None
+        self._other_loops_cancel_scope: Optional[anyio.CancelScope] = None
+        self._io_loops_cancel_scope: Optional[anyio.CancelScope] = None
 
     # State machine callbacks
+    # def on_exit_connected(self):
+    #     if self._io_loops_cancel_scope is not None:
+    #         self._io_loops_cancel_scope.cancel()
+    #         self._io_loops_cancel_scope = None
+
     def on_enter_connecting(self):
-        async def start_loops():
+        async def start_io_loops():
             async with anyio.create_task_group() as tg:
-                self._loop_cancel_scope = tg.cancel_scope
-                tg.start_soon(self._open_msg_stream)
+                self._io_loops_cancel_scope = tg.cancel_scope
                 tg.start_soon(self._read_loop)
                 tg.start_soon(self._write_loop)
+
+        async def start_other_loops():
+            async with anyio.create_task_group() as tg:
+                self._other_loops_cancel_scope = tg.cancel_scope
+                tg.start_soon(self._open_inbound_msgs_tx_stream)
+                tg.start_soon(self._open_outbound_msgs_tx_stream)
+                tg.start_soon(self._publish_loop)
                 tg.start_soon(self._misc_loop)
-            self._loop_cancel_scope = None
+            self._other_loops_cancel_scope = None
 
         async def do_connect():
             async with anyio.create_task_group() as tg:
-                self._connecting_cancel_scope = tg.cancel_scope
-                tg.start_soon(self._connect_loop)
-            self._connecting_cancel_scope = None
+                self._reconnect_loop_cancel_scope = tg.cancel_scope
+                tg.start_soon(self._reconnect_loop)
+            self._reconnect_loop_cancel_scope = None
 
-        self._msg_tx, self._msg_rx = anyio.create_memory_object_stream()
-        self._task_group.start_soon(start_loops)
+        if self._io_loops_cancel_scope is None:
+            self._task_group.start_soon(start_io_loops)
+        if self._other_loops_cancel_scope is None:
+            self._task_group.start_soon(start_other_loops)
         self._task_group.start_soon(do_connect)
 
     def on_exit_connecting(self):
-        if self._connecting_cancel_scope is not None:
-            self._connecting_cancel_scope.cancel()
-            self._connecting_cancel_scope = None
+        if self._reconnect_loop_cancel_scope is not None:
+            self._reconnect_loop_cancel_scope.cancel()
+            self._reconnect_loop_cancel_scope = None
 
     def on_enter_disconnected(self):
-        if self._loop_cancel_scope is not None:
-            self._loop_cancel_scope.cancel()
-            self._loop_cancel_scope = None
+        if self._io_loops_cancel_scope is not None:
+            self._io_loops_cancel_scope.cancel()
+            self._io_loops_cancel_scope = None
+
+        if self._other_loops_cancel_scope is not None:
+            self._other_loops_cancel_scope.cancel()
+            self._other_loops_cancel_scope = None
+
+    def on_exit_disconnected(self):
+        (
+            self._inbound_msgs_tx,
+            self._inbound_msgs_rx,
+        ) = anyio.create_memory_object_stream()
 
     # Public API
     def connect(self, *args, **kwargs):
         _LOG.debug("connect() called")
-        self._connect_args = (args, kwargs)
+        self._client.connect_async(*args, **kwargs)
         self._state_request_connect()
 
     def disconnect(self, *args, **kwargs):
         _LOG.debug("disconnect() called")
-        self._client.disconnect(*args, **kwargs)
+        return self._client.disconnect(*args, **kwargs)
 
-    def subscribe(self, *args, **kwargs) -> None:
+    def subscribe(self, *args, **kwargs):
         _LOG.debug("subscribe() called")
         self._subscriptions.append((args, kwargs))
-        if self.is_connected():
-            self._client.subscribe(*args, **kwargs)
+        self._client.subscribe(*args, **kwargs)
 
     def publish(self, *args, **kwargs):
-        pass
+        # return self._client.publish(*args, **kwargs)
+        if self.is_disconnected():
+            raise DisconnectedException(
+                "Cannot publish while the client is disconnected."
+            )
+        tx_stream = self._outbound_msgs_tx.clone()
+        try:
+            tx_stream.send_nowait((args, kwargs))
+        except anyio.WouldBlock:
+            raise BufferError("Outbound message buffer is full")
 
     @property
     def messages(self):
-        return self._msg_rx
+        return self._inbound_msgs_rx
 
     # Paho client callbacks
     def _on_connect(self, client, userdata, flags, rc) -> None:
-        _LOG.debug("_on_connect()")
+        _LOG.debug("_on_connect() rc: %s", rc)
+        if rc != paho.CONNACK_ACCEPTED:
+            # TODO: What do we do on error?
+            _LOG.error(
+                "Error connecting to MQTT broker (rc: %s - %s)",
+                rc,
+                paho.connack_string(rc),
+            )
+            return
         self._state_succeed_connect()
         for args, kwargs in self._subscriptions:
             _LOG.debug("Subscribing with %s, %s", args, kwargs)
@@ -134,7 +186,7 @@ class AnyIOMQTTClient:
 
     def _on_message(self, client, userdata, msg: paho.MQTTMessage):
         _LOG.debug("MQTT message received on topic %s", msg.topic)
-        msg_tx = self._msg_tx.clone()
+        msg_tx = self._inbound_msgs_tx.clone()
         try:
             msg_tx.send_nowait(msg)
         except anyio.WouldBlock:
@@ -150,12 +202,17 @@ class AnyIOMQTTClient:
 
     def _on_socket_close(self, client, userdata, sock) -> None:
         self._sock = None
+        # Set the previous event, to make sure we don't deadlock any existing waiters.
+        # They'll just have to deal with the fact that the socket is actually closed.
+        self._socket_open.set()
         self._socket_open = anyio.Event()
 
     def _on_socket_register_write(self, client, userdata, sock):
         self._large_write.set()
 
     def _on_socket_unregister_write(self, client, userdata, sock):
+        # Set the previous event, to make sure we don't deadlock any existing waiters.
+        self._large_write.set()
         self._large_write = anyio.Event()
 
     # Loops
@@ -167,6 +224,7 @@ class AnyIOMQTTClient:
                 await anyio.wait_socket_readable(self._sock)
             except ValueError:
                 _LOG.exception("Exception when awaiting readable socket")
+                await anyio.sleep(1)
                 continue
             # TODO: Try/except?
             self._client.loop_read()
@@ -180,6 +238,7 @@ class AnyIOMQTTClient:
                 await anyio.wait_socket_writable(self._sock)
             except ValueError:
                 _LOG.exception("Exception when awaiting writable socket")
+                await anyio.sleep(1)
                 continue
             self._client.loop_write()
 
@@ -191,27 +250,51 @@ class AnyIOMQTTClient:
             self._client.loop_misc()
             await anyio.sleep(1)
 
-    async def _connect_loop(self) -> None:
-        _LOG.debug("_connect_loop() started")
-        args, kwargs = self._connect_args
-        while True:
+    async def _reconnect_loop(self) -> None:
+        _LOG.debug("_reconnect_loop() started")
+        connection_status = None
+        while connection_status != paho.MQTT_ERR_SUCCESS:
             try:
-                connect = partial(self._client.connect, *args, **kwargs)
-                _LOG.debug("Connecting...")
-                await anyio.to_thread.run_sync(connect)
+                _LOG.debug("(Re)connecting...")
+                connection_status = await anyio.to_thread.run_sync(
+                    self._client.reconnect
+                )
+                if connection_status != paho.MQTT_ERR_SUCCESS:
+                    _LOG.error(
+                        "(Re)connection failed with code %s (%s)",
+                        connection_status,
+                        paho.error_string(connection_status),
+                    )
             except Exception:
-                _LOG.exception("Connection failed")
+                _LOG.exception("(Re)connection failed")
+            if connection_status != paho.MQTT_ERR_SUCCESS:
+                # TODO: Configurable reconnect delay / limit
                 await anyio.sleep(1)
-                continue
-            _LOG.debug("_connect_loop() setting perform_connect state")
-            return
+            _LOG.debug("_reconnect_loop() finiished")
 
-    async def _open_msg_stream(self):
+    async def _open_inbound_msgs_tx_stream(self):
         """
-        Hold the tx end of the msg stream open so that we can clone it and send messages
-        from the paho on_message callback.
+        Hold the tx end of the inbound msgs stream open so that we can clone it and send
+        messages from the paho on_message callback.
         """
-        _LOG.debug("_open_msg_stream() started")
-        async with self._msg_tx:
+        _LOG.debug("_open_inbound_msgs_tx_stream() started")
+        async with self._inbound_msgs_tx:
             while True:
                 await anyio.sleep(math.inf)
+
+    async def _open_outbound_msgs_tx_stream(self):
+        """
+        Hold the tx end of the outbound msgs stream open so that we can clone it and send
+        messages from the publish() method.
+        """
+        _LOG.debug("_open_outbound_msgs_tx_stream() started")
+        async with self._outbound_msgs_tx:
+            while True:
+                await anyio.sleep(math.inf)
+
+    async def _publish_loop(self):
+        _LOG.debug("_publish_loop() started")
+        async for args, kwargs in self._outbound_msgs_rx:
+            _LOG.debug("Publishing message %s %s", args, kwargs)
+            ret = self._client.publish(*args, **kwargs)
+            _LOG.debug("Paho client returned %s", ret)
