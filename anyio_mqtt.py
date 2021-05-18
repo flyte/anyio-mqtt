@@ -20,8 +20,6 @@ logging.getLogger("transitions").setLevel(logging.DEBUG)
 # TODO:
 # - Error handling. Work out what constitutes a reason to break out of the connect loop
 #   and change back to disconnected state.
-# - QoS levels. How do they affect subscribing and publishing?
-# - Publishing.
 
 
 class DisconnectedException(Exception):
@@ -72,11 +70,6 @@ class AnyIOMQTTClient:
         self._io_loops_cancel_scope: Optional[anyio.CancelScope] = None
 
     # State machine callbacks
-    # def on_exit_connected(self):
-    #     if self._io_loops_cancel_scope is not None:
-    #         self._io_loops_cancel_scope.cancel()
-    #         self._io_loops_cancel_scope = None
-
     def on_enter_connecting(self):
         async def start_io_loops():
             async with anyio.create_task_group() as tg:

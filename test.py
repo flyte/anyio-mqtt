@@ -47,6 +47,12 @@ async def main():
                 _LOG.debug("Calling client.disconnect()")
                 client.disconnect()
                 break
+        _LOG.debug("Publishing message to a/b/c with QoS 0")
+        client.publish("a/b/c", "3hi0", qos=0)
+        _LOG.debug("Publishing message to a/b/c with QoS 1")
+        client.publish("a/b/c", "3hi1", qos=1)
+        _LOG.debug("Publishing message to a/b/c with QoS 2")
+        client.publish("a/b/c", "3hi2", qos=2)
         _LOG.debug("Waiting 3 seconds")
         await anyio.sleep(3)
         _LOG.debug("Connecting to broker")
