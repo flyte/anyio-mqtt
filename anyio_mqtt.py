@@ -28,17 +28,6 @@ class AnyIOMQTTClient:
             config = {}
 
         self._task_group = task_group
-
-        states = ["disconnected", "connecting", "connected"]
-        transitions = [
-            ["_state_request_connect", "*", "connecting"],
-            ["_state_succeed_connect", "connecting", "connected"],
-            ["_state_disconnect", "*", "disconnected"],
-        ]
-        self._machine = Machine(
-            model=self, states=states, transitions=transitions, initial="disconnected"
-        )
-
         self._sock: Optional[socket.socket] = None
 
         self._client: paho.Client = paho.Client(**config)
@@ -49,6 +38,16 @@ class AnyIOMQTTClient:
         self._client.on_socket_close = self._on_socket_close
         self._client.on_socket_register_write = self._on_socket_register_write
         self._client.on_socket_unregister_write = self._on_socket_unregister_write
+
+        states = ["disconnected", "connecting", "connected"]
+        transitions = [
+            ["_state_request_connect", "*", "connecting"],
+            ["_state_succeed_connect", "connecting", "connected"],
+            ["_state_disconnect", "*", "disconnected"],
+        ]
+        self._machine = Machine(
+            model=self, states=states, transitions=transitions, initial="disconnected"
+        )
 
         (
             self._inbound_msgs_tx,
@@ -118,20 +117,16 @@ class AnyIOMQTTClient:
         self._client.connect_async(*args, **kwargs)
         self._state_request_connect()
 
-    def disconnect(self, *args, **kwargs):
-        _LOG.debug("disconnect() called")
-        return self._client.disconnect(*args, **kwargs)
-
     def subscribe(self, *args, **kwargs):
         _LOG.debug("subscribe() called")
         self._subscriptions.append((args, kwargs))
         self._client.subscribe(*args, **kwargs)
 
-    def publish(self, *args, **kwargs):
-        return self._client.publish(*args, **kwargs)
-
-    def will_set(self, *args, **kwargs):
-        return self._client.will_set(*args, **kwargs)
+    def __getattr__(self, item: str):
+        """
+        Expose the Paho client's attributes as our own.
+        """
+        return getattr(self._client, item)
 
     @property
     def messages(self):
