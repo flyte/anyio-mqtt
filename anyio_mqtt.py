@@ -130,6 +130,9 @@ class AnyIOMQTTClient:
     def publish(self, *args, **kwargs):
         return self._client.publish(*args, **kwargs)
 
+    def will_set(self, *args, **kwargs):
+        return self._client.will_set(*args, **kwargs)
+
     @property
     def messages(self):
         return self._inbound_msgs_rx
