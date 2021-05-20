@@ -57,12 +57,19 @@ class AnyIOMQTTClient:
         self._socket_open = anyio.Event()
         self._large_write = anyio.Event()
 
+        self._read_loop_started = anyio.Event()
+        self._write_loop_started = anyio.Event()
+
         self._subscriptions = []
         self._last_disconnect = datetime.min
 
         self._reconnect_loop_cancel_scope: Optional[anyio.CancelScope] = None
         self._other_loops_cancel_scope: Optional[anyio.CancelScope] = None
         self._io_loops_cancel_scope: Optional[anyio.CancelScope] = None
+
+    async def wait_for_io_loops(self):
+        await self._read_loop_started.wait()
+        await self._write_loop_started.wait()
 
     # State machine callbacks
     def on_enter_connecting(self):
@@ -110,6 +117,10 @@ class AnyIOMQTTClient:
             self._inbound_msgs_tx,
             self._inbound_msgs_rx,
         ) = anyio.create_memory_object_stream()
+        self._read_loop_started.set()
+        self._read_loop_started = anyio.Event()
+        self._write_loop_started.set()
+        self._write_loop_started = anyio.Event()
 
     # Public API
     def connect(self, *args, **kwargs):
@@ -195,6 +206,7 @@ class AnyIOMQTTClient:
     # Loops
     async def _read_loop(self) -> None:
         _LOG.debug("_read_loop() started")
+        self._read_loop_started.set()
         while True:
             await self._socket_open.wait()
             try:
@@ -208,6 +220,7 @@ class AnyIOMQTTClient:
 
     async def _write_loop(self):
         _LOG.debug("_write_loop() started")
+        self._write_loop_started.set()
         while True:
             await self._large_write.wait()
             await self._socket_open.wait()
