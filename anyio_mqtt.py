@@ -126,15 +126,7 @@ class AnyIOMQTTClient:
         """
         Expose the Paho client's attributes as our own.
         """
-        attr = getattr(self._client, item)
-        if not callable(attr):
-            return attr
-
-        @wraps(attr)
-        async def wrapper(*args, **kwargs):
-            await anyio.to_thread.run_sync(partial(attr, *args, **kwargs))
-
-        return wrapper
+        return getattr(self._client, item)
 
     @property
     def messages(self):
