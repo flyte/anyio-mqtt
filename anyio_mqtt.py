@@ -121,12 +121,13 @@ class AnyIOMQTTClient:
         _LOG.debug("subscribe() called")
         self._subscriptions.append((args, kwargs))
 
-        def wait_for_callback_mutex():
-            self._client._callback_mutex.acquire()
-            self._client._callback_mutex.release()
+        # def wait_for_callback_mutex():
+        #     self._client._callback_mutex.acquire()
+        #     self._client._callback_mutex.release()
 
-        await anyio.to_thread.run_sync(wait_for_callback_mutex)
-        self._client.subscribe(*args, **kwargs)
+        # await anyio.to_thread.run_sync(wait_for_callback_mutex)
+        await anyio.to_thread.run_sync(partial(self._client.subscribe, *args, **kwargs))
+        # self._client.subscribe(*args, **kwargs)
 
     def __getattr__(self, item: str):
         """
