@@ -57,19 +57,12 @@ class AnyIOMQTTClient:
         self._socket_open = anyio.Event()
         self._large_write = anyio.Event()
 
-        self._read_loop_started = anyio.Event()
-        self._write_loop_started = anyio.Event()
-
         self._subscriptions = []
         self._last_disconnect = datetime.min
 
         self._reconnect_loop_cancel_scope: Optional[anyio.CancelScope] = None
         self._other_loops_cancel_scope: Optional[anyio.CancelScope] = None
         self._io_loops_cancel_scope: Optional[anyio.CancelScope] = None
-
-    async def wait_for_io_loops(self):
-        await self._read_loop_started.wait()
-        await self._write_loop_started.wait()
 
     # State machine callbacks
     def on_enter_connecting(self):
@@ -117,10 +110,6 @@ class AnyIOMQTTClient:
             self._inbound_msgs_tx,
             self._inbound_msgs_rx,
         ) = anyio.create_memory_object_stream()
-        self._read_loop_started.set()
-        self._read_loop_started = anyio.Event()
-        self._write_loop_started.set()
-        self._write_loop_started = anyio.Event()
 
     # Public API
     def connect(self, *args, **kwargs):
@@ -128,9 +117,15 @@ class AnyIOMQTTClient:
         self._client.connect_async(*args, **kwargs)
         self._state_request_connect()
 
-    def subscribe(self, *args, **kwargs):
+    async def subscribe(self, *args, **kwargs):
         _LOG.debug("subscribe() called")
         self._subscriptions.append((args, kwargs))
+
+        def wait_for_callback_mutex():
+            self._client._callback_mutex.acquire()
+            self._client._callback_mutex.release()
+
+        await anyio.to_thread.run_sync(wait_for_callback_mutex)
         self._client.subscribe(*args, **kwargs)
 
     def __getattr__(self, item: str):
@@ -206,7 +201,6 @@ class AnyIOMQTTClient:
     # Loops
     async def _read_loop(self) -> None:
         _LOG.debug("_read_loop() started")
-        self._read_loop_started.set()
         while True:
             await self._socket_open.wait()
             try:
@@ -220,7 +214,6 @@ class AnyIOMQTTClient:
 
     async def _write_loop(self):
         _LOG.debug("_write_loop() started")
-        self._write_loop_started.set()
         while True:
             await self._large_write.wait()
             await self._socket_open.wait()
