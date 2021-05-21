@@ -174,6 +174,12 @@ class AnyIOMQTTClient:
         self._client.subscribe(*args, **kwargs)
         # await anyio.to_thread.run_sync(partial(self._client.subscribe, *args, **kwargs))
 
+    async def wait_for_state(self, state: State):
+        while True:
+            await self.state_changed.wait()
+            if self.state == state:
+                return
+
     def __getattr__(self, item: str):
         """
         Expose the Paho client's attributes as our own.
