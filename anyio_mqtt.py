@@ -56,6 +56,7 @@ class AnyIOMQTTClient:
 
         self._socket_open = anyio.Event()
         self._large_write = anyio.Event()
+        self.disconnect_event = anyio.Event()
 
         self._subscriptions = []
         self._last_disconnect = datetime.min
@@ -105,11 +106,14 @@ class AnyIOMQTTClient:
             self._other_loops_cancel_scope.cancel()
             self._other_loops_cancel_scope = None
 
+        self.disconnect_event.set()
+
     def on_exit_disconnected(self):
         (
             self._inbound_msgs_tx,
             self._inbound_msgs_rx,
         ) = anyio.create_memory_object_stream()
+        self.disconnect_event = anyio.Event()
 
     # Public API
     def connect(self, *args, **kwargs):
