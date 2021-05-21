@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import anyio
 import anyio.abc
 import paho.mqtt.client as paho
+import sniffio
 from transitions import Machine
 
 _LOG = logging.getLogger(__name__)
@@ -186,7 +187,12 @@ class AnyIOMQTTClient:
         # Set the previous event, to make sure we don't deadlock any existing waiters.
         # They'll just have to deal with the fact that the socket is actually closed.
         self._socket_open.set()
-        self._socket_open = anyio.Event()
+        try:
+            self._socket_open = anyio.Event()
+        except sniffio.AsyncLibraryNotFoundError:
+            _LOG.debug(
+                "Unable to recreate self._socket_open event due to not being in aync context"
+            )
 
     def _on_socket_register_write(self, client, userdata, sock):
         self._large_write.set()
