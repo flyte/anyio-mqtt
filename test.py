@@ -9,17 +9,21 @@ logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("transitions").setLevel(logging.DEBUG)
 logging.getLogger("anyio_mqtt").setLevel(logging.DEBUG)
 
+PAHO_LOGGER = logging.getLogger("paho")
+PAHO_LOGGER.setLevel(logging.DEBUG)
+
 
 async def main():
     async with anyio.create_task_group() as tg:
         _LOG.debug("Creating client")
         client = AnyIOMQTTClient(tg)
+        client.enable_logger(PAHO_LOGGER)
         _LOG.debug("Subscribing to a/b/c")
-        await client.subscribe("a/b/c")
+        client.subscribe("a/b/c")
         _LOG.debug("Connecting to broker")
         client.connect("localhost")
         _LOG.debug("Subscribing to d/e/f")
-        await client.subscribe("d/e/f")
+        client.subscribe("d/e/f")
         _LOG.debug("Publishing message to a/b/c with QoS 0")
         client.publish("a/b/c", "hi0", qos=0)
         _LOG.debug("Publishing message to a/b/c with QoS 1")

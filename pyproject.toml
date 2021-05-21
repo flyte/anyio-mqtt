@@ -9,7 +9,6 @@ license = "MIT"
 python = "^3.6.2"
 anyio = "^3.0.1"
 paho-mqtt = "^1.5.1"
-transitions = "^0.8.8"
 
 [tool.poetry.dev-dependencies]
 isort = "^5.8.0"

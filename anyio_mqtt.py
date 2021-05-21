@@ -1,15 +1,13 @@
+import enum
 import logging
 import math
 import socket
-from functools import partial, wraps
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 from datetime import datetime, timedelta
 
 import anyio
 import anyio.abc
 import paho.mqtt.client as paho
-import sniffio
-from transitions import Machine
 
 _LOG = logging.getLogger(__name__)
 
@@ -19,20 +17,21 @@ _LOG = logging.getLogger(__name__)
 #   and change back to disconnected state.
 
 
+class State(enum.Enum):
+    INITIAL = enum.auto()
+    DISCONNECTED = enum.auto()
+    CONNECTING = enum.auto()
+    CONNECTED = enum.auto()
+
+
 class DisconnectedException(Exception):
     pass
 
 
 class AnyIOMQTTClient:
-    def __init__(
-        self,
-        task_group: anyio.abc.TaskGroup,
-        config=None
-    ):
+    def __init__(self, task_group: anyio.abc.TaskGroup, config=None):
         if config is None:
             config = {}
-
-        self._connect_message: Optional[Tuple[List[Any], Dict[str, Any]]] = None
 
         self._task_group = task_group
         self._sock: Optional[socket.socket] = None
@@ -44,26 +43,24 @@ class AnyIOMQTTClient:
         self._client.on_socket_open = self._on_socket_open
         self._client.on_socket_close = self._on_socket_close
         self._client.on_socket_register_write = self._on_socket_register_write
-        self._client.on_socket_unregister_write = self._on_socket_unregister_write
+        # self._client.on_socket_unregister_write = self._on_socket_unregister_write
 
-        states = ["disconnected", "connecting", "connected"]
-        transitions = [
-            ["_state_request_connect", "*", "connecting"],
-            ["_state_succeed_connect", "connecting", "connected"],
-            ["_state_disconnect", "*", "disconnected"],
-        ]
-        self._machine = Machine(
-            model=self, states=states, transitions=transitions, initial="disconnected"
-        )
+        self._state: State = State.INITIAL
+        (
+            self._internal_state_tx,
+            self._internal_state_rx,
+        ) = anyio.create_memory_object_stream(1)
+        (
+            self._external_state_tx,
+            self._external_state_rx,
+        ) = anyio.create_memory_object_stream()
 
         (
             self._inbound_msgs_tx,
             self._inbound_msgs_rx,
         ) = anyio.create_memory_object_stream()
 
-        self._socket_open = anyio.Event()
-        self._large_write = anyio.Event()
-        self.disconnect_event = anyio.Event()
+        self._write_tx, self._write_rx = anyio.create_memory_object_stream()
 
         self._subscriptions = []
         self._last_disconnect = datetime.min
@@ -72,77 +69,107 @@ class AnyIOMQTTClient:
         self._other_loops_cancel_scope: Optional[anyio.CancelScope] = None
         self._io_loops_cancel_scope: Optional[anyio.CancelScope] = None
 
-    # State machine callbacks
-    def on_enter_connected(self):
-        if self._connect_message is not None:
-            args, kwargs = self._connect_message
-            self._client.publish(*args, **kwargs)
+        task_group.start_soon(self._hold_stream_open, self._internal_state_tx)
+        task_group.start_soon(self._hold_stream_open, self._external_state_tx)
+        task_group.start_soon(self._hold_stream_open, self._external_state_rx)
+        task_group.start_soon(self.handle_state_changes)
 
-    def on_enter_connecting(self):
-        async def start_io_loops():
+    async def handle_state_changes(self):
+        async for old_state, new_state in self._internal_state_rx:
+            self._state = new_state
+            if old_state == new_state:
+                continue
+            _LOG.debug("New state: %s", new_state)
+
+            if old_state == State.CONNECTING:
+                await self.on_exit_connecting()
+            # elif old_state == State.DISCONNECTED:
+            #     await self.on_exit_disconnected()
+            # elif old_state == State.CONNECTED:
+            #     await self.on_exit_connected()
+
+            if new_state == State.DISCONNECTED:
+                await self.on_enter_disconnected()
+            elif new_state == State.CONNECTING:
+                await self.on_enter_connecting()
+            # elif new_state == State.CONNECTED:
+            #     await self.on_enter_connected()
+
+            await self.after_state_change()
+
+    async def start_io_loops(self, task_status=anyio.TASK_STATUS_IGNORED):
+        try:
             async with anyio.create_task_group() as tg:
                 self._io_loops_cancel_scope = tg.cancel_scope
+                self._write_tx, self._write_rx = anyio.create_memory_object_stream()
+                await tg.start(self._hold_stream_open, self._write_tx)
                 tg.start_soon(self._read_loop)
                 tg.start_soon(self._write_loop)
+                task_status.started()
+        finally:
+            self._io_loops_cancel_scope = None
 
+    def stop_io_loops(self):
+        if self._io_loops_cancel_scope is not None:
+            self._io_loops_cancel_scope.cancel()
+
+    # State machine callbacks
+    async def after_state_change(self):
+        try:
+            self._external_state_tx.send_nowait(self._state)
+        except anyio.WouldBlock:
+            _LOG.debug(
+                "Unable to send new state (%s) to external state stream", self._state
+            )
+
+    async def on_enter_connecting(self):
         async def start_other_loops():
-            async with anyio.create_task_group() as tg:
-                self._other_loops_cancel_scope = tg.cancel_scope
-                tg.start_soon(self._open_inbound_msgs_tx_stream)
-                tg.start_soon(self._misc_loop)
-            self._other_loops_cancel_scope = None
+            try:
+                async with anyio.create_task_group() as tg:
+                    self._other_loops_cancel_scope = tg.cancel_scope
+                    tg.start_soon(self._hold_stream_open, self._inbound_msgs_tx)
+                    tg.start_soon(self._misc_loop)
+            finally:
+                self._other_loops_cancel_scope = None
 
         async def do_connect():
-            async with anyio.create_task_group() as tg:
-                self._reconnect_loop_cancel_scope = tg.cancel_scope
-                tg.start_soon(self._reconnect_loop)
-            self._reconnect_loop_cancel_scope = None
+            try:
+                async with anyio.create_task_group() as tg:
+                    self._reconnect_loop_cancel_scope = tg.cancel_scope
+                    tg.start_soon(self._reconnect_loop)
+            finally:
+                self._reconnect_loop_cancel_scope = None
 
-        if self._io_loops_cancel_scope is None:
-            self._task_group.start_soon(start_io_loops)
         if self._other_loops_cancel_scope is None:
             self._task_group.start_soon(start_other_loops)
         self._task_group.start_soon(do_connect)
 
-    def on_exit_connecting(self):
+    async def on_exit_connecting(self):
         if self._reconnect_loop_cancel_scope is not None:
             self._reconnect_loop_cancel_scope.cancel()
-            self._reconnect_loop_cancel_scope = None
 
-    def on_enter_disconnected(self):
+    async def on_enter_disconnected(self):
         if self._io_loops_cancel_scope is not None:
             self._io_loops_cancel_scope.cancel()
-            self._io_loops_cancel_scope = None
 
         if self._other_loops_cancel_scope is not None:
             self._other_loops_cancel_scope.cancel()
-            self._other_loops_cancel_scope = None
-
-        self.disconnect_event.set()
-
-    def on_exit_disconnected(self):
-        (
-            self._inbound_msgs_tx,
-            self._inbound_msgs_rx,
-        ) = anyio.create_memory_object_stream()
-        self.disconnect_event = anyio.Event()
 
     # Public API
     def connect(self, *args, **kwargs):
         _LOG.debug("connect() called")
         self._client.connect_async(*args, **kwargs)
-        self._state_request_connect()
+        (
+            self._inbound_msgs_tx,
+            self._inbound_msgs_rx,
+        ) = anyio.create_memory_object_stream()
+        self._update_state(State.CONNECTING)
 
-    async def subscribe(self, *args, **kwargs):
+    def subscribe(self, *args, **kwargs):
         _LOG.debug("subscribe() called")
         self._subscriptions.append((args, kwargs))
-        await anyio.to_thread.run_sync(partial(self._client.subscribe, *args, **kwargs))
-
-    def set_connect_message(self, *args, **kwargs):
-        self._connect_message = (args, kwargs)
-
-    def clear_connect_message(self):
-        self._connect_message = None
+        self._client.subscribe(*args, **kwargs)
+        # await anyio.to_thread.run_sync(partial(self._client.subscribe, *args, **kwargs))
 
     def __getattr__(self, item: str):
         """
@@ -154,8 +181,23 @@ class AnyIOMQTTClient:
     def messages(self):
         return self._inbound_msgs_rx
 
+    @property
+    def states(self):
+        return self._external_state_rx.clone()
+
+    @property
+    def state(self):
+        return self._state
+
+    def _update_state(self, state):
+        try:
+            self._internal_state_tx.send_nowait((self._state, state))
+        except anyio.WouldBlock:
+            _LOG.debug("Unable to update client state to %s", state)
+
     # Paho client callbacks
     def _on_connect(self, client, userdata, flags, rc) -> None:
+        # Called from main thread (via loop_read())
         _LOG.debug("_on_connect() rc: %s", rc)
         if rc != paho.CONNACK_ACCEPTED:
             # TODO: What do we do on error?
@@ -165,25 +207,25 @@ class AnyIOMQTTClient:
                 paho.connack_string(rc),
             )
             return
-        self._state_succeed_connect()
+        self._update_state(State.CONNECTED)
         for args, kwargs in self._subscriptions:
             _LOG.debug("Subscribing with %s, %s", args, kwargs)
             client.subscribe(*args, **kwargs)
 
     def _on_disconnect(self, client, userdata, rc, properties=None) -> None:
+        # Called from main thread (via loop_misc())
         _LOG.debug("_on_disconnect() rc: %s", rc)
         self._last_disconnect = datetime.now()
         if rc == paho.MQTT_ERR_SUCCESS:  # rc == 0
             # Deliberately disconnected on client request
-            self._state_disconnect()
+            self._update_state(State.DISCONNECTED)
         else:
-            self._state_request_connect()
+            self._update_state(State.CONNECTING)
 
     def _on_message(self, client, userdata, msg: paho.MQTTMessage):
         _LOG.debug("MQTT message received on topic %s", msg.topic)
-        msg_tx = self._inbound_msgs_tx.clone()
         try:
-            msg_tx.send_nowait(msg)
+            self._inbound_msgs_tx.send_nowait(msg)
         except anyio.WouldBlock:
             _LOG.warning("Discarding message because no handler is listening")
 
@@ -191,39 +233,50 @@ class AnyIOMQTTClient:
         self, client: paho.Client, userdata: Any, sock: socket.socket
     ) -> None:
         _LOG.debug("_on_socket_open()")
-        self._sock = sock
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2048)
 
-        async def set_socket_open():
-            self._socket_open.set()
+        async def on_socket_open():
+            self._sock = sock
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2048)
+            await self._task_group.start(self.start_io_loops)
 
-        anyio.from_thread.run(set_socket_open)
+        try:
+            anyio.from_thread.run(on_socket_open)
+        except RuntimeError:
+            self._task_group.start_soon(on_socket_open)
 
     def _on_socket_close(self, client, userdata, sock) -> None:
-        self._sock = None
-        # Set the previous event, to make sure we don't deadlock any existing waiters.
-        # They'll just have to deal with the fact that the socket is actually closed.
-        self._socket_open.set()
+        _LOG.debug("_on_socket_close()")
+
+        async def on_socket_close():
+            self.stop_io_loops()
+            self._sock = None
+
         try:
-            self._socket_open = anyio.Event()
-        except sniffio.AsyncLibraryNotFoundError:
-            _LOG.debug(
-                "Unable to recreate self._socket_open event due to not being in aync context"
-            )
+            anyio.from_thread.run(on_socket_close)
+        except RuntimeError:
+            self._task_group.start_soon(on_socket_close)
 
     def _on_socket_register_write(self, client, userdata, sock):
-        self._large_write.set()
+        async def register_write():
+            try:
+                self._write_tx.send_nowait(None)
+            except anyio.WouldBlock:
+                _LOG.debug("Unable to register write")
 
-    def _on_socket_unregister_write(self, client, userdata, sock):
-        # Set the previous event, to make sure we don't deadlock any existing waiters.
-        self._large_write.set()
-        self._large_write = anyio.Event()
+        try:
+            anyio.from_thread.run(register_write)
+        except RuntimeError:
+            self._task_group.start_soon(register_write)
+
+    # def _on_socket_unregister_write(self, client, userdata, sock):
+    #     # Set the previous event, to make sure we don't deadlock any existing waiters.
+    #     self._large_write.set()
+    #     self._large_write = anyio.Event()
 
     # Loops
     async def _read_loop(self) -> None:
         _LOG.debug("_read_loop() started")
         while True:
-            await self._socket_open.wait()
             try:
                 await anyio.wait_socket_readable(self._sock)
             except ValueError:
@@ -233,11 +286,9 @@ class AnyIOMQTTClient:
             # TODO: Try/except?
             self._client.loop_read()
 
-    async def _write_loop(self):
+    async def _write_loop(self) -> None:
         _LOG.debug("_write_loop() started")
-        while True:
-            await self._large_write.wait()
-            await self._socket_open.wait()
+        async for _ in self._write_rx:
             try:
                 await anyio.wait_socket_writable(self._sock)
             except ValueError:
@@ -264,6 +315,8 @@ class AnyIOMQTTClient:
             if delay > 0:
                 _LOG.info("Waiting %s second(s) before reconnecting", delay)
                 await anyio.sleep(delay)
+            if self._io_loops_cancel_scope is None:
+                _LOG.warning("Reconnecting while the IO loops are not running")
             try:
                 _LOG.debug("(Re)connecting...")
                 connection_status = await anyio.to_thread.run_sync(
@@ -282,12 +335,16 @@ class AnyIOMQTTClient:
                 await anyio.sleep(1)
             _LOG.debug("_reconnect_loop() finished")
 
-    async def _open_inbound_msgs_tx_stream(self):
+    async def _hold_stream_open(self, stream, task_status=anyio.TASK_STATUS_IGNORED):
         """
-        Hold the tx end of the inbound msgs stream open so that we can clone it and send
-        messages from the paho on_message callback.
+        Hold the stream open so that it doesn't close when we can clone it and then
+        discard the clone.
         """
-        _LOG.debug("_open_inbound_msgs_tx_stream() started")
-        async with self._inbound_msgs_tx:
-            while True:
-                await anyio.sleep(math.inf)
+        _LOG.debug("_hold_stream_open(%s) started", stream)
+        try:
+            async with stream:
+                task_status.started()
+                while True:
+                    await anyio.sleep(math.inf)
+        finally:
+            _LOG.debug("_hold_stream_open(%s) finished", stream)
