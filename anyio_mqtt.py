@@ -24,9 +24,15 @@ class DisconnectedException(Exception):
 
 
 class AnyIOMQTTClient:
-    def __init__(self, task_group: anyio.abc.TaskGroup, config=None):
+    def __init__(
+        self,
+        task_group: anyio.abc.TaskGroup,
+        config=None,
+        connected_message_args: Optional[Tuple[List[Any], Dict[str, Any]]] = None,
+    ):
         if config is None:
             config = {}
+        self._connected_message_args = connected_message_args
 
         self._task_group = task_group
         self._sock: Optional[socket.socket] = None
@@ -67,6 +73,11 @@ class AnyIOMQTTClient:
         self._io_loops_cancel_scope: Optional[anyio.CancelScope] = None
 
     # State machine callbacks
+    def on_enter_connected(self):
+        if self._connected_message_args is not None:
+            args, kwargs = self._connected_message_args
+            self._client.publish(*args, **kwargs)
+
     def on_enter_connecting(self):
         async def start_io_loops():
             async with anyio.create_task_group() as tg:
