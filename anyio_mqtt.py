@@ -54,6 +54,7 @@ class AnyIOMQTTClient:
             self._external_state_tx,
             self._external_state_rx,
         ) = anyio.create_memory_object_stream()
+        self.state_changed = anyio.Event()
 
         (
             self._inbound_msgs_tx,
@@ -115,6 +116,8 @@ class AnyIOMQTTClient:
 
     # State machine callbacks
     async def after_state_change(self):
+        self.state_changed.set()
+        self.state_changed = anyio.Event()
         try:
             self._external_state_tx.send_nowait(self._state)
         except anyio.WouldBlock:
