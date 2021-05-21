@@ -27,12 +27,12 @@ class AnyIOMQTTClient:
     def __init__(
         self,
         task_group: anyio.abc.TaskGroup,
-        config=None,
-        connected_message_args: Optional[Tuple[List[Any], Dict[str, Any]]] = None,
+        config=None
     ):
         if config is None:
             config = {}
-        self._connected_message_args = connected_message_args
+
+        self._connect_message: Optional[Tuple[List[Any], Dict[str, Any]]] = None
 
         self._task_group = task_group
         self._sock: Optional[socket.socket] = None
@@ -74,8 +74,8 @@ class AnyIOMQTTClient:
 
     # State machine callbacks
     def on_enter_connected(self):
-        if self._connected_message_args is not None:
-            args, kwargs = self._connected_message_args
+        if self._connect_message is not None:
+            args, kwargs = self._connect_message
             self._client.publish(*args, **kwargs)
 
     def on_enter_connecting(self):
@@ -137,6 +137,12 @@ class AnyIOMQTTClient:
         _LOG.debug("subscribe() called")
         self._subscriptions.append((args, kwargs))
         await anyio.to_thread.run_sync(partial(self._client.subscribe, *args, **kwargs))
+
+    def set_connect_message(self, *args, **kwargs):
+        self._connect_message = (args, kwargs)
+
+    def clear_connect_message(self):
+        self._connect_message = None
 
     def __getattr__(self, item: str):
         """
