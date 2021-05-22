@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "anyio-mqtt"
-version = "0.1.0"
+version = "0.1.1"
 description = ""
 authors = ["Ellis Percival <anyio-mqtt@failcode.co.uk>"]
 license = "MIT"
