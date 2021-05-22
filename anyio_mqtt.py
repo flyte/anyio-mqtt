@@ -342,7 +342,7 @@ class AnyIOMQTTClient:
             if connection_status != paho.MQTT_ERR_SUCCESS:
                 # TODO: Configurable reconnect delay / limit
                 await anyio.sleep(1)
-            _LOG.debug("_reconnect_loop() finished")
+        _LOG.debug("_reconnect_loop() finished")
 
     async def _hold_stream_open(self, stream, task_status=anyio.TASK_STATUS_IGNORED):
         """
