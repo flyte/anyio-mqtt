@@ -12,6 +12,8 @@ paho-mqtt = "^1.5.1"
 
 [tool.poetry.dev-dependencies]
 isort = "^5.8.0"
+pylint = "^2.8.2"
+mypy = "^0.812"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
