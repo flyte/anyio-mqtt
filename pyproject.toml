@@ -1,10 +1,11 @@
 [tool.poetry]
 name = "anyio-mqtt"
 version = "0.1.3"
-description = ""
+description = "Very early work in progress of an AnyIO MQTT client"
 authors = ["Ellis Percival <anyio-mqtt@failcode.co.uk>"]
 license = "MIT"
 include = ["py.typed"]
+readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.6.2"
