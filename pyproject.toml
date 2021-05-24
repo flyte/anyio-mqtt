@@ -4,6 +4,7 @@ version = "0.1.1"
 description = ""
 authors = ["Ellis Percival <anyio-mqtt@failcode.co.uk>"]
 license = "MIT"
+include = ["py.typed"]
 
 [tool.poetry.dependencies]
 python = "^3.6.2"
