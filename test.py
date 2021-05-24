@@ -6,21 +6,21 @@ import logging
 
 _LOG = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
-logging.getLogger("transitions").setLevel(logging.DEBUG)
 logging.getLogger("anyio_mqtt").setLevel(logging.DEBUG)
 
 PAHO_LOGGER = logging.getLogger("paho")
 PAHO_LOGGER.setLevel(logging.DEBUG)
 
 
-async def main():
+async def main() -> None:
     _LOG.debug("Creating client")
     async with AnyIOMQTTClient() as client:
         client.enable_logger(PAHO_LOGGER)
+        client.username_pw_set("test", "tesffffft")
         _LOG.debug("Subscribing to a/b/c")
         client.subscribe("a/b/c")
         _LOG.debug("Connecting to broker")
-        client.connect("localhost")
+        client.connect("walternate")
         _LOG.debug("Subscribing to d/e/f")
         client.subscribe("d/e/f")
         _LOG.debug("Publishing message to a/b/c with QoS 0")

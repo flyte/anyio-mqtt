@@ -5,6 +5,7 @@ AnyIO wrapper around Paho MQTT client.
 import enum
 import logging
 import socket
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from functools import wraps
 from types import TracebackType
@@ -13,6 +14,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, Union,
 import anyio
 import anyio.abc
 import paho.mqtt.client as paho  # type: ignore
+from tenacity import RetryError, retry
+from tenacity.before_sleep import before_sleep_log
+from tenacity.wait import wait_exponential
 
 if TYPE_CHECKING:
     from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
@@ -31,6 +35,30 @@ class State(enum.Enum):
     CONNECTED = enum.auto()
 
 
+@dataclass
+class AnyIOMQTTClientConfig:
+    paho_config: Dict[str, Any] = field(default_factory=dict)
+    retry_delay_min: int = 1
+    retry_delay_max: int = 64
+
+
+async def _hold_stream_open(
+    stream: Union["MemoryObjectSendStream[Any]", "MemoryObjectReceiveStream[Any]"],
+    task_status: anyio.abc.TaskStatus = anyio.TASK_STATUS_IGNORED,
+) -> None:
+    """
+    Hold the stream open so that it doesn't close when we can clone it and then
+    discard the clone.
+    """
+    _LOG.debug("_hold_stream_open(%s) started", stream)
+    try:
+        async with stream:
+            task_status.started()
+            await anyio.sleep_forever()
+    finally:
+        _LOG.debug("_hold_stream_open(%s) finished", stream)
+
+
 class AnyIOMQTTClient:
     """
     AnyIO wrapper around Paho MQTT client.
@@ -38,14 +66,16 @@ class AnyIOMQTTClient:
 
     # pylint: disable=unused-argument
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
-        if config is None:
-            config = {}
+    def __init__(self, config: AnyIOMQTTClientConfig = AnyIOMQTTClientConfig()) -> None:
+        self._config = config
 
         self._task_group = anyio.create_task_group()
         self._sock: Optional[socket.socket] = None
 
-        self._client: paho.Client = paho.Client(**config)
+        self._connect_disconnect = anyio.Event()
+        self._reconnect_success = anyio.Event()
+
+        self._client: paho.Client = paho.Client(**config.paho_config)
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
         self._client.on_message = self._on_message
@@ -59,7 +89,7 @@ class AnyIOMQTTClient:
         (
             self._internal_state_tx,
             self._internal_state_rx,
-        ) = anyio.create_memory_object_stream(1)
+        ) = anyio.create_memory_object_stream()
         self._external_state_tx: "MemoryObjectSendStream[State]"
         self._external_state_rx: "MemoryObjectReceiveStream[State]"
         (
@@ -77,7 +107,7 @@ class AnyIOMQTTClient:
 
         self.write_tx: "MemoryObjectSendStream[None]"
         self.write_rx: "MemoryObjectReceiveStream[None]"
-        self._write_tx, self._write_rx = anyio.create_memory_object_stream()
+        self._write_tx, self._write_rx = anyio.create_memory_object_stream(10)
 
         self._subscriptions: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = []
         self._last_disconnect = datetime.min
@@ -88,10 +118,10 @@ class AnyIOMQTTClient:
 
     async def __aenter__(self) -> "AnyIOMQTTClient":
         await self._task_group.__aenter__()
-        await self._task_group.start(self._hold_stream_open, self._internal_state_tx)
-        await self._task_group.start(self._hold_stream_open, self._external_state_tx)
-        await self._task_group.start(self._hold_stream_open, self._external_state_rx)
-        self._task_group.start_soon(self._handle_state_changes)
+        await self._task_group.start(_hold_stream_open, self._internal_state_tx)
+        await self._task_group.start(self._handle_state_changes)
+        await self._task_group.start(_hold_stream_open, self._external_state_tx)
+        await self._task_group.start(_hold_stream_open, self._external_state_rx)
         return self
 
     async def __aexit__(
@@ -100,10 +130,11 @@ class AnyIOMQTTClient:
         exc_v: Optional[BaseException],
         exc_tb: Optional[TracebackType],
     ) -> Optional[bool]:
-        _LOG.debug("Disconnecting on context exit")
-        self.disconnect()
-        _LOG.debug("Waiting for disconnected state")
-        await self.wait_for_state(State.DISCONNECTED)
+        if self._state == State.CONNECTED:
+            _LOG.debug("Disconnecting on context exit")
+            self.disconnect()
+            _LOG.debug("Waiting for disconnected state")
+            await self.wait_for_state(State.DISCONNECTED)
         _LOG.debug("Cancelling task group")
         self._task_group.cancel_scope.cancel()
         _LOG.debug("Awaiting task group exit")
@@ -173,7 +204,7 @@ class AnyIOMQTTClient:
         try:
             self._internal_state_tx.send_nowait((self._state, state))
         except anyio.WouldBlock:
-            _LOG.debug("Unable to update client state to %s", state)
+            _LOG.error("Unable to update internal client state to %s", state)
 
     async def _start_io_loops(
         self, task_status: anyio.abc.TaskStatus = anyio.TASK_STATUS_IGNORED
@@ -182,7 +213,7 @@ class AnyIOMQTTClient:
             async with anyio.create_task_group() as task_group:
                 self._io_loops_cancel_scope = task_group.cancel_scope
                 self._write_tx, self._write_rx = anyio.create_memory_object_stream()
-                await task_group.start(self._hold_stream_open, self._write_tx)
+                await task_group.start(_hold_stream_open, self._write_tx)
                 task_group.start_soon(self._read_loop)
                 task_group.start_soon(self._write_loop)
                 task_status.started()
@@ -216,7 +247,7 @@ class AnyIOMQTTClient:
             try:
                 async with anyio.create_task_group() as task_group:
                     self._other_loops_cancel_scope = task_group.cancel_scope
-                    task_group.start_soon(self._hold_stream_open, self._inbound_msgs_tx)
+                    await task_group.start(_hold_stream_open, self._inbound_msgs_tx)
                     task_group.start_soon(self._misc_loop)
             finally:
                 self._other_loops_cancel_scope = None
@@ -289,72 +320,64 @@ class AnyIOMQTTClient:
 
     async def _reconnect_loop(self) -> None:
         _LOG.debug("_reconnect_loop() started")
-        connection_status = None
-        while connection_status != paho.MQTT_ERR_SUCCESS:
-            delay = (
-                (self._last_disconnect + timedelta(seconds=1)) - datetime.now()
-            ).total_seconds()
-            if delay > 0:
-                _LOG.info("Waiting %s second(s) before reconnecting", delay)
-                await anyio.sleep(delay)
-            try:
-                _LOG.debug("(Re)connecting...")
-                connection_status = await anyio.to_thread.run_sync(self._client.reconnect)
-                if connection_status != paho.MQTT_ERR_SUCCESS:
-                    _LOG.error(
-                        "(Re)connection failed with code %s (%s)",
-                        connection_status,
-                        paho.error_string(connection_status),
-                    )
-            # Doesn't really matter why it failed, so catch everything here
-            except Exception:  # pylint: disable=broad-except
-                _LOG.exception("(Re)connection failed")
-            if connection_status != paho.MQTT_ERR_SUCCESS:
-                # TODO: Configurable reconnect delay / limit
-                await anyio.sleep(1)
+
+        @retry(
+            wait=wait_exponential(  # type: ignore[no-untyped-call]
+                multiplier=1,
+                min=self._config.retry_delay_min,
+                max=self._config.retry_delay_max,
+            ),
+            sleep=anyio.sleep,
+            before_sleep=before_sleep_log(  # type: ignore[no-untyped-call]
+                _LOG, logging.DEBUG
+            ),
+        )
+        async def do_reconnect() -> None:
+            _LOG.debug("do_reconnect() started")
+            self._connect_disconnect = anyio.Event()
+            self._reconnect_success = anyio.Event()
+            code = await anyio.to_thread.run_sync(self._client.reconnect)
+            if code != paho.MQTT_ERR_SUCCESS:
+                err_str = "(Re)connection failed with code %s (%s)" % (
+                    code,
+                    paho.error_string(code),
+                )
+                _LOG.error(err_str)
+                raise ConnectionError(err_str)
+            await self._connect_disconnect.wait()
+            if not self._reconnect_success.is_set():
+                err_str = "(Re)connection failed after server response"
+                _LOG.error(err_str)
+                raise ConnectionError(err_str)
+
+        _LOG.debug("(Re)connecting...")
+        await do_reconnect()
         _LOG.debug("_reconnect_loop() finished")
 
-    async def _hold_stream_open(
-        self,
-        stream: Union["MemoryObjectSendStream[Any]", "MemoryObjectReceiveStream[Any]"],
-        task_status: anyio.abc.TaskStatus = anyio.TASK_STATUS_IGNORED,
+    async def _handle_state_changes(
+        self, task_status: anyio.abc.TaskStatus = anyio.TASK_STATUS_IGNORED
     ) -> None:
-        """
-        Hold the stream open so that it doesn't close when we can clone it and then
-        discard the clone.
-        """
-        _LOG.debug("_hold_stream_open(%s) started", stream)
-        try:
-            async with stream:
-                task_status.started()
-                await anyio.sleep_forever()
-        finally:
-            _LOG.debug("_hold_stream_open(%s) finished", stream)
+        _LOG.debug("_handle_state_changes() started")
+        async with self._internal_state_rx:
+            _LOG.debug("_handle_state_changes() opened _internal_state_rx")
+            task_status.started()
+            # https://github.com/agronholm/anyio/issues/297
+            # pylint: disable=not-an-iterable
+            async for old_state, new_state in self._internal_state_rx:
+                self._state = new_state
+                if old_state == new_state:
+                    continue
+                _LOG.debug("New state: %s", new_state)
 
-    async def _handle_state_changes(self) -> None:
-        # https://github.com/agronholm/anyio/issues/297
-        # pylint: disable=not-an-iterable
-        async for old_state, new_state in self._internal_state_rx:
-            self._state = new_state
-            if old_state == new_state:
-                continue
-            _LOG.debug("New state: %s", new_state)
+                if old_state == State.CONNECTING:
+                    await self.on_exit_connecting()
 
-            if old_state == State.CONNECTING:
-                await self.on_exit_connecting()
-            # elif old_state == State.DISCONNECTED:
-            #     await self.on_exit_disconnected()
-            # elif old_state == State.CONNECTED:
-            #     await self.on_exit_connected()
+                if new_state == State.DISCONNECTED:
+                    await self.on_enter_disconnected()
+                elif new_state == State.CONNECTING:
+                    await self.on_enter_connecting()
 
-            if new_state == State.DISCONNECTED:
-                await self.on_enter_disconnected()
-            elif new_state == State.CONNECTING:
-                await self.on_enter_connecting()
-            # elif new_state == State.CONNECTED:
-            #     await self.on_enter_connected()
-
-            await self.after_state_change()
+                await self.after_state_change()
 
     # Paho client callbacks
     def _on_connect(  # pylint: disable=invalid-name
@@ -367,6 +390,7 @@ class AnyIOMQTTClient:
     ) -> None:
         # Called from main thread (via loop_read())
         _LOG.debug("_on_connect() rc: %s", rc)
+        self._connect_disconnect.set()
         if rc != paho.CONNACK_ACCEPTED:
             _LOG.error(
                 "Error connecting to MQTT broker (rc: %s - %s)",
@@ -374,6 +398,7 @@ class AnyIOMQTTClient:
                 paho.connack_string(rc),
             )
             return
+        self._reconnect_success.set()
         self._update_state(State.CONNECTED)
         for args, kwargs in self._subscriptions:
             _LOG.debug("Subscribing with %s, %s", args, kwargs)
@@ -388,6 +413,7 @@ class AnyIOMQTTClient:
     ) -> None:
         # Called from main thread (via loop_misc())
         _LOG.debug("_on_disconnect() rc: %s", rc)
+        self._connect_disconnect.set()
         self._last_disconnect = datetime.now()
         if rc == paho.MQTT_ERR_SUCCESS:  # rc == 0
             # Deliberately disconnected on client request
@@ -446,7 +472,7 @@ class AnyIOMQTTClient:
             try:
                 self._write_tx.send_nowait(None)
             except anyio.WouldBlock:
-                _LOG.debug("Unable to register write")
+                _LOG.error("Unable to register write")
 
         try:
             anyio.from_thread.run(register_write)
