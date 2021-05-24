@@ -14,9 +14,8 @@ PAHO_LOGGER.setLevel(logging.DEBUG)
 
 
 async def main():
-    async with anyio.create_task_group() as tg:
-        _LOG.debug("Creating client")
-        client = AnyIOMQTTClient(tg)
+    _LOG.debug("Creating client")
+    async with AnyIOMQTTClient() as client:
         client.enable_logger(PAHO_LOGGER)
         _LOG.debug("Subscribing to a/b/c")
         client.subscribe("a/b/c")
@@ -70,6 +69,12 @@ async def main():
             print(
                 f"Message received in test.py (3): {msg.topic} - {msg.payload.decode('utf8')}"
             )
+            i += 1
+            if i >= 5:
+                print("Breaking out of last msg loop")
+                break
+        print("Now leaving async context...")
+    print("Finished!")
 
 
 if __name__ == "__main__":

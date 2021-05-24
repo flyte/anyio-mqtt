@@ -4,18 +4,18 @@ AnyIO wrapper around Paho MQTT client.
 
 import enum
 import logging
-import math
 import socket
 from datetime import datetime, timedelta
 from functools import wraps
-from typing import Any, Dict, List, Optional, TYPE_CHECKING, Tuple, Union, cast
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, Union, cast
 
 import anyio
 import anyio.abc
 import paho.mqtt.client as paho  # type: ignore
 
 if TYPE_CHECKING:
-    from anyio.streams.memory import MemoryObjectSendStream, MemoryObjectReceiveStream
+    from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
 _LOG = logging.getLogger(__name__)
 
@@ -38,13 +38,11 @@ class AnyIOMQTTClient:
 
     # pylint: disable=unused-argument
 
-    def __init__(
-        self, task_group: anyio.abc.TaskGroup, config: Optional[Dict[str, Any]] = None
-    ) -> None:
+    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         if config is None:
             config = {}
 
-        self._task_group = task_group
+        self._task_group = anyio.create_task_group()
         self._sock: Optional[socket.socket] = None
 
         self._client: paho.Client = paho.Client(**config)
@@ -68,7 +66,7 @@ class AnyIOMQTTClient:
             self._external_state_tx,
             self._external_state_rx,
         ) = anyio.create_memory_object_stream()
-        self.state_changed = anyio.Event()  # type: ignore[no-untyped-call]
+        self.state_changed = anyio.Event()
 
         self._inbound_msgs_tx: "MemoryObjectSendStream[paho.MQTTMessage]"
         self._inbound_msgs_rx: "MemoryObjectReceiveStream[paho.MQTTMessage]"
@@ -88,10 +86,30 @@ class AnyIOMQTTClient:
         self._other_loops_cancel_scope: Optional[anyio.CancelScope] = None
         self._io_loops_cancel_scope: Optional[anyio.CancelScope] = None
 
-        task_group.start_soon(self._hold_stream_open, self._internal_state_tx)
-        task_group.start_soon(self._hold_stream_open, self._external_state_tx)
-        task_group.start_soon(self._hold_stream_open, self._external_state_rx)
-        task_group.start_soon(self._handle_state_changes)
+    async def __aenter__(self) -> "AnyIOMQTTClient":
+        await self._task_group.__aenter__()
+        await self._task_group.start(self._hold_stream_open, self._internal_state_tx)
+        await self._task_group.start(self._hold_stream_open, self._external_state_tx)
+        await self._task_group.start(self._hold_stream_open, self._external_state_rx)
+        self._task_group.start_soon(self._handle_state_changes)
+        return self
+
+    async def __aexit__(
+        self,
+        exc_t: Optional[Type[BaseException]],
+        exc_v: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> Optional[bool]:
+        _LOG.debug("Disconnecting on context exit")
+        self.disconnect()
+        _LOG.debug("Waiting for disconnected state")
+        await self.wait_for_state(State.DISCONNECTED)
+        _LOG.debug("Cancelling task group")
+        self._task_group.cancel_scope.cancel()
+        _LOG.debug("Awaiting task group exit")
+        ret = await self._task_group.__aexit__(exc_t, exc_v, exc_tb)
+        _LOG.debug("Task group exited")
+        return ret
 
     # Public API
     @property
@@ -181,8 +199,7 @@ class AnyIOMQTTClient:
         Perform actions on every state change.
         """
         self.state_changed.set()
-        # Ignore mypy error until https://github.com/agronholm/anyio/pull/289 is released
-        self.state_changed = anyio.Event()  # type: ignore[no-untyped-call]
+        self.state_changed = anyio.Event()
         try:
             self._external_state_tx.send_nowait(self._state)
         except anyio.WouldBlock:
@@ -280,8 +297,6 @@ class AnyIOMQTTClient:
             if delay > 0:
                 _LOG.info("Waiting %s second(s) before reconnecting", delay)
                 await anyio.sleep(delay)
-            if self._io_loops_cancel_scope is None:
-                _LOG.warning("Reconnecting while the IO loops are not running")
             try:
                 _LOG.debug("(Re)connecting...")
                 connection_status = await anyio.to_thread.run_sync(self._client.reconnect)
@@ -312,8 +327,7 @@ class AnyIOMQTTClient:
         try:
             async with stream:
                 task_status.started()
-                while True:
-                    await anyio.sleep(math.inf)
+                await anyio.sleep_forever()
         finally:
             _LOG.debug("_hold_stream_open(%s) finished", stream)
 
@@ -413,6 +427,12 @@ class AnyIOMQTTClient:
         async def on_socket_close() -> None:
             self._stop_io_loops()
             self._sock = None
+
+        if self._task_group.cancel_scope.cancel_called:
+            _LOG.debug(
+                "Not running on_socket_close() because our task group has been cancelled"
+            )
+            return
 
         try:
             anyio.from_thread.run(on_socket_close)
