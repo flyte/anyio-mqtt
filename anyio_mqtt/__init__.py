@@ -203,8 +203,8 @@ class AnyIOMQTTClient:
     def _update_state(self, state: State) -> None:
         try:
             self._internal_state_tx.send_nowait((self._state, state))
-        except anyio.WouldBlock:
-            _LOG.error("Unable to update internal client state to %s", state)
+        except (anyio.WouldBlock, anyio.BrokenResourceError):
+            _LOG.exception("Unable to update internal client state to %s", state)
 
     async def _start_io_loops(
         self, task_status: anyio.abc.TaskStatus = anyio.TASK_STATUS_IGNORED
