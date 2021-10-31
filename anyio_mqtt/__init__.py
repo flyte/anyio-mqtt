@@ -6,15 +6,15 @@ import enum
 import logging
 import socket
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from functools import wraps
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, Union
 
 import anyio
 import anyio.abc
 import paho.mqtt.client as paho  # type: ignore
-from tenacity import RetryError, retry
+from tenacity import retry
 from tenacity.before_sleep import before_sleep_log
 from tenacity.wait import wait_exponential
 
@@ -75,6 +75,8 @@ class AnyIOMQTTClient:
         self._connect_disconnect = anyio.Event()
         self._reconnect_success = anyio.Event()
 
+        self._protocol = config.paho_config.get("protocol", paho.MQTTv311)
+
         self._client: paho.Client = paho.Client(**config.paho_config)
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
@@ -82,6 +84,10 @@ class AnyIOMQTTClient:
         self._client.on_socket_open = self._on_socket_open
         self._client.on_socket_close = self._on_socket_close
         self._client.on_socket_register_write = self._on_socket_register_write
+        if self._protocol == paho.MQTTv5:
+            self._client.on_subscribe = self._on_subscribe_v5
+        else:
+            self._client.on_subscribe = self._on_subscribe
 
         self._state: State = State.INITIAL
         self._internal_state_tx: "MemoryObjectSendStream[Tuple[State, State]]"
@@ -110,6 +116,8 @@ class AnyIOMQTTClient:
         self._write_tx, self._write_rx = anyio.create_memory_object_stream(10)
 
         self._subscriptions: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = []
+        self._subscription_events: Dict[int, anyio.Event] = {}
+
         self._last_disconnect = datetime.min
 
         self._reconnect_loop_cancel_scope: Optional[anyio.CancelScope] = None
@@ -179,10 +187,14 @@ class AnyIOMQTTClient:
     @wraps(paho.Client.subscribe)
     def subscribe(  # pylint: disable=missing-function-docstring
         self, *args: Any, **kwargs: Any
-    ) -> Tuple[int, int]:
+    ) -> Tuple[int, Optional[int]]:
         _LOG.debug("subscribe() called")
         self._subscriptions.append((args, kwargs))
-        return cast(Tuple[int, int], self._client.subscribe(*args, **kwargs))
+        result: int
+        mid: Optional[int]
+        result, mid = self._client.subscribe(*args, **kwargs)
+        self._subscription_events[mid] = anyio.Event()
+        return result, mid
 
     async def wait_for_state(self, state: State) -> None:
         """
@@ -192,6 +204,18 @@ class AnyIOMQTTClient:
             await self.state_changed.wait()
             if self.state == state:
                 return
+
+    async def wait_for_subscription(self, mid: int) -> None:
+        """
+        Returns when the subscription message ID is confirmed by the broker.
+        """
+        _LOG.debug(
+            "wait_for_subscription(mid=%d) waiting for subscription event to be set", mid
+        )
+        if mid not in self._subscription_events:
+            raise ValueError("Provided 'mid' isn't one we've got an event for")
+        await self._subscription_events[mid].wait()
+        del self._subscription_events[mid]
 
     def __getattr__(self, item: str) -> Any:
         """
@@ -280,6 +304,10 @@ class AnyIOMQTTClient:
 
         if self._other_loops_cancel_scope is not None:
             self._other_loops_cancel_scope.cancel()
+
+    async def on_subscribe(self, mid: int) -> None:
+        _LOG.debug("on_subscribe(mid=%d) setting event", mid)
+        self._subscription_events.get(mid, anyio.Event()).set()
 
     # Loops
     async def _read_loop(self) -> None:
@@ -478,3 +506,21 @@ class AnyIOMQTTClient:
             anyio.from_thread.run(register_write)
         except RuntimeError:
             self._task_group.start_soon(register_write)
+
+    def _on_subscribe_v5(
+        self, client: paho.Client, userdata: Any, mid: int, reasoncodes, properties
+    ) -> None:
+        _LOG.debug("_on_subscribe_v5()")
+        try:
+            anyio.from_thread.run(self.on_subscribe, mid)
+        except RuntimeError:
+            self._task_group.start_soon(self.on_subscribe, mid)
+
+    def _on_subscribe(
+        self, client: paho.Client, userdata: Any, mid: int, granted_qos: int
+    ) -> None:
+        _LOG.debug("_on_subscribe()")
+        try:
+            anyio.from_thread.run(self.on_subscribe, mid)
+        except RuntimeError:
+            self._task_group.start_soon(self.on_subscribe, mid)
