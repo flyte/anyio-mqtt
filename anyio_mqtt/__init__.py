@@ -200,10 +200,8 @@ class AnyIOMQTTClient:
         """
         Returns when desired state is reached.
         """
-        while True:
+        while self.state != state:
             await self.state_changed.wait()
-            if self.state == state:
-                return
 
     async def wait_for_subscription(self, mid: int) -> None:
         """

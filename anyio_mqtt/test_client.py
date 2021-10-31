@@ -34,6 +34,26 @@ async def test_connect(anyio_backend, mosquitto):
             await client.wait_for_state(State.CONNECTED)
 
 
+async def test_disconnect_context_exit(anyio_backend, mosquitto):
+    client = AnyIOMQTTClient(AnyIOMQTTClientConfig(dict(clean_session=True)))
+    async with client:
+        client.connect("localhost", 1883)
+        with anyio.fail_after(5):
+            await client.wait_for_state(State.CONNECTED)
+    with anyio.fail_after(5):
+        await client.wait_for_state(State.DISCONNECTED)
+
+
+async def test_disconnect_explicit(anyio_backend, mosquitto):
+    async with AnyIOMQTTClient(AnyIOMQTTClientConfig(dict(clean_session=True))) as client:
+        client.connect("localhost", 1883)
+        with anyio.fail_after(5):
+            await client.wait_for_state(State.CONNECTED)
+        client.disconnect()
+        with anyio.fail_after(5):
+            await client.wait_for_state(State.DISCONNECTED)
+
+
 async def test_subscribe(anyio_backend, mosquitto):
     async with AnyIOMQTTClient(AnyIOMQTTClientConfig(dict(clean_session=True))) as client:
         client.connect("localhost", 1883)
@@ -52,7 +72,7 @@ async def test_receive(anyio_backend, mosquitto):
         client.connect("localhost", 1883)
         with anyio.fail_after(5):
             await client.wait_for_state(State.CONNECTED)
-        _, mid = client.subscribe("anyio-mqtt/test")
+        _, mid = client.subscribe(topic)
         assert mid is not None
         with anyio.fail_after(5):
             await client.wait_for_subscription(mid)
@@ -62,13 +82,13 @@ async def test_receive(anyio_backend, mosquitto):
 
             async def publish():
                 await listening.wait()
-                client.publish("anyio-mqtt/test", "hi")
+                client.publish(topic, msg)
 
             tg.start_soon(publish)
             with anyio.fail_after(5):
                 async with client.messages:
                     listening.set()
                     async for msg_rx in client.messages:
-                        assert msg_rx.topic == "anyio-mqtt/test"
-                        assert msg_rx.payload.decode("utf8") == "hi"
+                        assert msg_rx.topic == topic
+                        assert msg_rx.payload.decode("utf8") == msg
                         break
