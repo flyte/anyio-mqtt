@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "anyio-mqtt"
-version = "0.3.1"
+version = "0.3.2"
 description = "Very early work in progress of an AnyIO MQTT client"
 authors = ["Ellis Percival <anyio-mqtt@failcode.co.uk>"]
 license = "MIT"
@@ -20,6 +20,7 @@ pylint = "^2.8.2"
 mypy = "^0.812"
 pytest = "^6.2.5"
 trio = "^0.19.0"
+bamp = "^1.0.2"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
