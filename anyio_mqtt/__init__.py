@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, Union
 import anyio
 import anyio.abc
 import paho.mqtt.client as paho  # type: ignore
-from tenacity import retry
+import tenacity
 from tenacity.before_sleep import before_sleep_log
 from tenacity.wait import wait_exponential
 
@@ -312,13 +312,15 @@ class AnyIOMQTTClient:
         _LOG.debug("_read_loop() started")
         while True:
             if self._sock is None:
-                raise RuntimeError("Read loop is running, but _sock is None")
+                _LOG.warning("Read loop is running, but _sock is None")
+                self._stop_io_loops()
+                return
             try:
                 await anyio.wait_socket_readable(self._sock)
             except ValueError:
                 _LOG.exception("Exception when awaiting readable socket")
-                await anyio.sleep(1)
-                continue
+                self._stop_io_loops()
+                return
             # TODO: Try/except?
             self._client.loop_read()
 
@@ -327,13 +329,15 @@ class AnyIOMQTTClient:
         # https://github.com/agronholm/anyio/issues/297
         async for _ in self._write_rx:  # pylint: disable=not-an-iterable
             if self._sock is None:
-                raise RuntimeError("Write loop is running, but _sock is None")
+                _LOG.warning("Write loop is running, but _sock is None")
+                self._stop_io_loops()
+                return
             try:
                 await anyio.wait_socket_writable(self._sock)
             except ValueError:
                 _LOG.exception("Exception when awaiting writable socket")
-                await anyio.sleep(1)
-                continue
+                self._stop_io_loops()
+                return
             self._client.loop_write()
 
     async def _misc_loop(self) -> None:
@@ -347,7 +351,7 @@ class AnyIOMQTTClient:
     async def _reconnect_loop(self) -> None:
         _LOG.debug("_reconnect_loop() started")
 
-        @retry(
+        @tenacity.retry(
             wait=wait_exponential(  # type: ignore[no-untyped-call]
                 multiplier=1,
                 min=self._config.retry_delay_min,
@@ -357,6 +361,7 @@ class AnyIOMQTTClient:
             before_sleep=before_sleep_log(  # type: ignore[no-untyped-call]
                 _LOG, logging.DEBUG
             ),
+            # retry=lambda: self._sock is None,
         )
         async def do_reconnect() -> None:
             _LOG.debug("do_reconnect() started")
